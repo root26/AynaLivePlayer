@@ -10,3 +10,4 @@ CMakeCache.txt
 log.txt
 config.ini
 config.ini.bak
+.gocache

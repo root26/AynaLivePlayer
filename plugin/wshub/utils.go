@@ -3,18 +3,26 @@ package wshub
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"unicode"
 )
 
-// capitalize is a helper function to safely capitalize the first letter of a string.
-// It's robust against empty strings.
-func capitalize(s string) string {
+// toCamelCase converts under_score or lowerCamel to UpperCamel (PascalCase) for JSON key compatibility.
+// It is robust against empty strings.
+func toCamelCase(s string) string {
 	if s == "" {
 		return ""
 	}
-	r := []rune(s)
-	r[0] = unicode.ToUpper(r[0])
-	return string(r)
+	parts := strings.Split(s, "_")
+	for i := range parts {
+		if parts[i] == "" {
+			continue
+		}
+		r := []rune(parts[i])
+		r[0] = unicode.ToUpper(r[0])
+		parts[i] = string(r)
+	}
+	return strings.Join(parts, "")
 }
 
 // capitalizeKeys recursively traverses an interface{} and capitalizes the keys of any maps it finds.
@@ -26,7 +34,7 @@ func capitalizeKeys(data interface{}) interface{} {
 		newMap := make(map[string]interface{})
 		for k, v := range value {
 			// Capitalize the key and recursively process the value.
-			newMap[capitalize(k)] = capitalizeKeys(v)
+			newMap[toCamelCase(k)] = capitalizeKeys(v)
 		}
 		return newMap
 
