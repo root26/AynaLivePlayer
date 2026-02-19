@@ -168,20 +168,24 @@ func (d *Diange) Enable() error {
 			}
 			d.isCurrentSystem = (!data.Media.IsLiveRoomUser()) && (data.Media.ToUser().Name == model.SystemUser.Name)
 		})
-	// check if all available source has a command in sourceConfigs, if not add this source to sourceConfigs
-	// actually, if default config exists, then this code does nothing.
-	prvdrs := miaosic.ListAvailableProviders()
-	for _, pvdr := range prvdrs {
-		// found pvdr in command list
-		if _, ok := d.sourceConfigs[pvdr]; ok {
-			continue
-		}
-		d.sourceConfigs[pvdr] = &sourceConfig{
-			Enable:   true,
-			Command:  "点" + pvdr + "歌",
-			Priority: len(d.sourceConfigs) + 1,
-		}
-	}
+	global.EventBus.Subscribe("",
+		events.MediaProviderUpdate,
+		"plugin.diange.provider.update",
+		func(event *eventbus.Event) {
+			// check if all available source has a command in sourceConfigs, if not add this source to sourceConfigs
+			// actually, if default config exists, then this code does nothing.
+			data := event.Data.(events.MediaProviderUpdateEvent)
+			for _, pvdr := range data.Providers {
+				if _, ok := d.sourceConfigs[pvdr]; ok {
+					continue
+				}
+				d.sourceConfigs[pvdr] = &sourceConfig{
+					Enable:   true,
+					Command:  "点" + pvdr + "歌",
+					Priority: len(d.sourceConfigs) + 1,
+				}
+			}
+		})
 	return nil
 }
 
@@ -214,6 +218,22 @@ func (d *Diange) getSource(cmd string) []string {
 		}
 	}
 	return sources
+}
+
+func (d *Diange) searchByProvider(provider, keywords string) ([]model.Media, error) {
+	resp, err := global.EventBus.Call(
+		events.CmdMiaosicSearch,
+		events.ReplyMiaosicSearch,
+		events.CmdMiaosicSearchData{
+			Keyword:  keywords,
+			Provider: provider,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	reply := resp.Data.(events.ReplyMiaosicSearchData)
+	return reply.Medias, reply.Error
 }
 
 func (d *Diange) handleMessage(event *eventbus.Event) {
@@ -292,7 +312,20 @@ func (d *Diange) handleMessage(event *eventbus.Event) {
 	var mediaMeta miaosic.MetaData
 	found := false
 	for _, source := range sources {
-		mediaMeta, found = miaosic.MatchMediaByProvider(source, keywords)
+		resp, err := global.EventBus.Call(
+			events.CmdMiaosicMatchMediaByProvider,
+			events.ReplyMiaosicMatchMediaByProvider,
+			events.CmdMiaosicMatchMediaByProviderData{
+				Provider: source,
+				Keyword:  keywords,
+			},
+		)
+		if err != nil {
+			continue
+		}
+		match := resp.Data.(events.ReplyMiaosicMatchMediaByProviderData)
+		mediaMeta = match.Meta
+		found = match.Found
 		if found {
 			break
 		}
@@ -302,22 +335,34 @@ func (d *Diange) handleMessage(event *eventbus.Event) {
 
 	if !found {
 		for _, source := range sources {
-			medias, err := miaosic.SearchByProvider(source, keywords, 1, 10)
+			medias, err := d.searchByProvider(source, keywords)
 			if len(medias) == 0 || err != nil {
 				continue
 			}
-			media = medias[0]
+			media = medias[0].Info
 			found = true
 			break
 		}
 	} else {
 		d.log.Info("Match media: ", mediaMeta)
-		m, err := miaosic.GetMediaInfo(mediaMeta)
+		resp, err := global.EventBus.Call(
+			events.CmdMiaosicGetMediaInfo,
+			events.ReplyMiaosicGetMediaInfo,
+			events.CmdMiaosicGetMediaInfoData{
+				Meta: mediaMeta,
+			},
+		)
 		if err != nil {
 			d.log.Error("Get media info failed: ", err)
 			found = false
+		} else {
+			reply := resp.Data.(events.ReplyMiaosicGetMediaInfoData)
+			if reply.Error != nil {
+				d.log.Error("Get media info failed: ", reply.Error)
+				found = false
+			}
+			media = reply.Info
 		}
-		media = m
 	}
 
 	if found {
@@ -410,11 +455,7 @@ func (d *Diange) CreatePanel() fyne.CanvasObject {
 		skipPlaylistCheck,
 	)
 	sourceCfgs := []fyne.CanvasObject{}
-	prvdrs := miaosic.ListAvailableProviders()
 	for source, cfg := range d.sourceConfigs {
-		if !slices.Contains(prvdrs, source) {
-			continue
-		}
 		sourceCfgs = append(
 			sourceCfgs, container.NewGridWithColumns(2,
 				widget.NewLabel(source),

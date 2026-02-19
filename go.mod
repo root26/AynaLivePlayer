@@ -12,7 +12,7 @@ replace (
 )
 
 require (
-	fyne.io/fyne/v2 v2.7.1
+	fyne.io/fyne/v2 v2.7.2
 	github.com/AynaLivePlayer/liveroom-sdk v0.1.0
 	github.com/AynaLivePlayer/miaosic v0.2.5
 	github.com/adrg/libvlc-go/v3 v3.1.6
@@ -38,7 +38,7 @@ require (
 )
 
 require (
-	fyne.io/systray v1.11.1-0.20250603113521-ca66a66d8b58 // indirect
+	fyne.io/systray v1.12.0 // indirect
 	github.com/AynaLivePlayer/blivedm-go v0.0.0-20251109134927-cc4a4ca07110 // indirect
 	github.com/BurntSushi/toml v1.5.0 // indirect
 	github.com/PuerkitoBio/goquery v1.10.3 // indirect

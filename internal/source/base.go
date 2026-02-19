@@ -36,6 +36,7 @@ func Initialize() {
 	log = global.Logger.WithPrefix("MediaProvider")
 
 	loadMediaProvider()
+	handleProvider()
 	handleSearch()
 	handleInfo()
 	createLyricLoader()
@@ -43,6 +44,7 @@ func Initialize() {
 
 	_ = global.EventBus.Publish(
 		events.MediaProviderUpdate, events.MediaProviderUpdateEvent{
-			Providers: miaosic.ListAvailableProviders(),
+			Providers:     miaosic.ListAvailableProviders(),
+			ProviderInfos: listProviderInfos(),
 		})
 }

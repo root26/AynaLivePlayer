@@ -3,6 +3,9 @@ package eventbus
 import (
 	"errors"
 	"fmt"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +54,10 @@ type bus struct {
 
 	// logger
 	log Logger
+
+	// worker context markers for deadlock detection in Call()
+	workerCtxMu sync.RWMutex
+	workerCtx   map[uint64]int // goroutine id -> worker idx
 }
 
 // New creates a new Bus.
@@ -75,22 +82,23 @@ func New(opts ...Option) Bus {
 		pending:       make([]*Event, 0, 16),
 		echoWaiter:    make(map[string]chan *Event),
 		log:           option.log,
+		workerCtx:     make(map[uint64]int),
 	}
 	for i := 0; i < option.maxWorkerSize; i++ {
-		b.addWorker()
+		b.addWorker(i)
 	}
 	return b
 }
 
-func (b *bus) addWorker() {
+func (b *bus) addWorker(workerIdx int) {
 	b.mu.Lock()
 	q := make(chan task, b.queueSize)
 	b.queues = append(b.queues, q)
-	go b.workerLoop(q)
+	go b.workerLoop(workerIdx, q)
 	b.mu.Unlock()
 }
 
-func (b *bus) workerLoop(q chan task) {
+func (b *bus) workerLoop(workerIdx int, q chan task) {
 	for {
 		select {
 		case <-b.stopCh:
@@ -105,7 +113,14 @@ func (b *bus) workerLoop(q chan task) {
 			}
 		case t := <-q:
 			func() {
+				gid := curGID()
+				b.workerCtxMu.Lock()
+				b.workerCtx[gid] = workerIdx
+				b.workerCtxMu.Unlock()
 				defer func() {
+					b.workerCtxMu.Lock()
+					delete(b.workerCtx, gid)
+					b.workerCtxMu.Unlock()
 					if r := recover(); r != nil {
 						b.log.Printf("handler panic recovered: event=%s handler=%s panic=%v", t.ev.Id, t.h.name, r)
 					}
@@ -301,6 +316,9 @@ func (b *bus) Call(eventId string, subEvtId string, data interface{}) (*Event, e
 	if eventId == "" {
 		return nil, errors.New("empty eventId")
 	}
+	if b.willDeadlockOnCall(eventId) {
+		return nil, fmt.Errorf("potential deadlock detected: sync Call(%s) from same worker shard", eventId)
+	}
 	echo := b.nextEchoId()
 	wait := make(chan *Event, 1)
 
@@ -326,6 +344,40 @@ func (b *bus) Call(eventId string, subEvtId string, data interface{}) (*Event, e
 	case <-b.stopCh:
 		return nil, errors.New("bus stopped")
 	}
+}
+
+func (b *bus) willDeadlockOnCall(eventId string) bool {
+	gid := curGID()
+	b.workerCtxMu.RLock()
+	currentWorker, inWorker := b.workerCtx[gid]
+	b.workerCtxMu.RUnlock()
+	if !inWorker {
+		return false
+	}
+
+	b.mu.RLock()
+	targetWorker, hasWorker := b.workerIdxes[eventId]
+	b.mu.RUnlock()
+	if !hasWorker {
+		return false
+	}
+	return currentWorker == targetWorker
+}
+
+func curGID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// first line format: "goroutine 123 [running]:\n"
+	line := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+	space := strings.IndexByte(line, ' ')
+	if space <= 0 {
+		return 0
+	}
+	id, err := strconv.ParseUint(line[:space], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
 }
 
 func (b *bus) Reply(req *Event, eventId string, data interface{}) error {

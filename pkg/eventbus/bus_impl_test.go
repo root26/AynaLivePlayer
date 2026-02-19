@@ -243,6 +243,37 @@ func TestCall(t *testing.T) {
 	require.Equal(t, "response to my-data", resp.Data)
 }
 
+func TestCall_FastFailOnPotentialDeadlock(t *testing.T) {
+	b := New(WithMaxWorkerSize(1), WithQueueSize(10))
+	err := b.Start()
+	require.NoError(t, err)
+	defer b.Stop()
+
+	// Ensure target event has a worker shard assignment.
+	err = b.Subscribe("", "inner-request", "inner-responder", func(event *Event) {
+		_ = b.Reply(event, "inner-response", "ok")
+	})
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	err = b.Subscribe("", "outer-request", "outer-handler", func(event *Event) {
+		_, callErr := b.Call("inner-request", "inner-response", nil)
+		done <- callErr
+	})
+	require.NoError(t, err)
+
+	err = b.Publish("outer-request", nil)
+	require.NoError(t, err)
+
+	select {
+	case callErr := <-done:
+		require.Error(t, callErr)
+		require.Contains(t, callErr.Error(), "potential deadlock detected")
+	case <-time.After(2 * time.Second):
+		t.Fatal("outer handler did not finish in time")
+	}
+}
+
 // TestCall_StopDuringWait checks that Call returns an error if the bus is stopped while waiting.
 func TestCall_StopDuringWait(t *testing.T) {
 	b := New(WithMaxWorkerSize(1), WithQueueSize(10))

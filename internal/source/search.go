@@ -16,6 +16,12 @@ func handleSearch() {
 			searchResult, err := miaosic.SearchByProvider(data.Provider, data.Keyword, 1, 10)
 			if err != nil {
 				log.Warnf("Search %s using %s failed: %s", data.Keyword, data.Provider, err)
+				_ = global.EventBus.Reply(
+					event, events.ReplyMiaosicSearch,
+					events.ReplyMiaosicSearchData{
+						Medias: make([]model.Media, 0),
+						Error:  err,
+					})
 				return
 			}
 			medias := make([]model.Media, len(searchResult))
@@ -29,6 +35,7 @@ func handleSearch() {
 				event, events.ReplyMiaosicSearch,
 				events.ReplyMiaosicSearchData{
 					Medias: medias,
+					Error:  nil,
 				})
 		})
 	if err != nil {
