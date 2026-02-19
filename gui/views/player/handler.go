@@ -11,9 +11,11 @@ func registerHandlers() {
 	global.EventBus.Subscribe(gctx.EventChannel, events.GUISetPlayerWindowOpenCmd, "gui.player.videoplayer.handleopen", func(event *eventbus.Event) {
 		data := event.Data.(events.GUISetPlayerWindowOpenCmdEvent)
 		if data.SetOpen {
-			playerWindow.Close()
-		} else {
 			showPlayerWindow()
+		} else {
+			if playerWindow != nil {
+				playerWindow.Hide()
+			}
 		}
 	})
 }

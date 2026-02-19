@@ -7,6 +7,7 @@ import (
 	"AynaLivePlayer/pkg/config"
 	"AynaLivePlayer/pkg/eventbus"
 	"AynaLivePlayer/pkg/logger"
+	"errors"
 	"fmt"
 	"github.com/AynaLivePlayer/miaosic"
 	"github.com/adrg/libvlc-go/v3"
@@ -26,43 +27,43 @@ var lock sync.Mutex
 var prevPercentPos float64 = 0
 var prevTimePos float64 = 0
 var duration float64 = 0
+var currentState = model.PlayerStateIdle
 var currentMedia model.Media
 var currentWindowHandle uintptr
 
 var audioDevices []model.AudioDevice
 var currentAudioDevice string
 
-var videoOptions = map[string][]string{
-	"windows": {"--video-filter=adjust", "--directx-hwnd"},
-	"darwin":  {"--vout=macosx"},
-	"linux":   {"--vout=x11", "--x11-display=:0"},
-}
-
 func setWindowHandle(handle uintptr) error {
-	return nil
+	if player == nil {
+		return errors.New("player is not initialized")
+	}
+	if handle == 0 {
+		return errors.New("invalid window handle 0")
+	}
+
 	os := runtime.GOOS
 	switch os {
 	case "windows":
 		// Windows 平台使用 DirectX
-		player.SetHWND(uintptr(handle))
+		if err := player.SetHWND(handle); err != nil {
+			return err
+		}
 	case "darwin":
 		// macOS 平台使用 NSView
-		player.SetNSObject(handle)
+		if err := player.SetNSObject(handle); err != nil {
+			return err
+		}
 	case "linux":
 		// Linux 平台使用 XWindow
-		player.SetXWindow(uint32(handle))
+		if err := player.SetXWindow(uint32(handle)); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unsupported platform: %s", os)
 	}
 
 	currentWindowHandle = handle
-
-	// 如果当前有媒体在播放，需要重新加载视频输出
-	if player.IsPlaying() {
-		player.Stop()
-		player.Play()
-	}
-
 	return nil
 }
 
@@ -71,11 +72,10 @@ func SetupPlayer() {
 	config.LoadConfig(cfg)
 	log = global.Logger.WithPrefix("VLC Player")
 
-	opts := []string{"--no-video", "--quiet"}
-	//os := runtime.GOOS
-	//if platformOpts, ok := videoOptions[os]; ok {
-	//	opts = append(opts, platformOpts...)
-	//}
+	opts := []string{"--quiet"}
+	if !cfg.DisplayMusicCover {
+		opts = append(opts, "--no-video")
+	}
 
 	// 初始化libvlc
 	if err := vlc.Init(opts...); err != nil {
@@ -113,6 +113,7 @@ func StopPlayer() {
 		log.Infof("save audio device config: %s", cfg.AudioDevice)
 	}
 	running = false
+	currentState = model.PlayerStateIdle
 	if player != nil {
 		err := player.Stop()
 		if err != nil {
@@ -133,9 +134,8 @@ func StopPlayer() {
 func registerEvents() {
 	// 播放结束事件
 	_, err := eventManager.Attach(vlc.MediaPlayerEndReached, func(e vlc.Event, userData interface{}) {
-		_ = global.EventBus.Publish(events.PlayerPropertyStateUpdate, events.PlayerPropertyStateUpdateEvent{
-			State: model.PlayerStateIdle,
-		})
+		currentState = model.PlayerStateIdle
+		_ = global.EventBus.Publish(events.PlayerPropertyStateUpdate, events.PlayerPropertyStateUpdateEvent{State: currentState})
 		_ = global.EventBus.Publish(events.PlayerPlayingUpdate, events.PlayerPlayingUpdateEvent{
 			Media:   model.Media{},
 			Removed: true,
@@ -195,12 +195,49 @@ func registerEvents() {
 
 	_, err = eventManager.Attach(vlc.MediaPlayerPlaying, func(e vlc.Event, userData interface{}) {
 		log.Debug("VLC player playing")
+		currentState = currentState.NextState(model.PlayerStatePlaying)
+		_ = global.EventBus.Publish(events.PlayerPropertyStateUpdate, events.PlayerPropertyStateUpdateEvent{
+			State: currentState,
+		})
 		_ = global.EventBus.Publish(events.PlayerPropertyPauseUpdate, events.PlayerPropertyPauseUpdateEvent{
 			Paused: false,
 		})
 	}, nil)
 	if err != nil {
 		log.Error("register MediaPlayerPlaying event failed: ", err)
+	}
+
+	_, err = eventManager.Attach(vlc.MediaPlayerOpening, func(e vlc.Event, userData interface{}) {
+		currentState = currentState.NextState(model.PlayerStateLoading)
+		_ = global.EventBus.Publish(events.PlayerPropertyStateUpdate, events.PlayerPropertyStateUpdateEvent{
+			State: currentState,
+		})
+	}, nil)
+	if err != nil {
+		log.Error("register MediaPlayerOpening event failed: ", err)
+	}
+
+	_, err = eventManager.Attach(vlc.MediaPlayerStopped, func(e vlc.Event, userData interface{}) {
+		currentState = model.PlayerStateIdle
+		_ = global.EventBus.Publish(events.PlayerPropertyStateUpdate, events.PlayerPropertyStateUpdateEvent{
+			State: currentState,
+		})
+	}, nil)
+	if err != nil {
+		log.Error("register MediaPlayerStopped event failed: ", err)
+	}
+
+	_, err = eventManager.Attach(vlc.MediaPlayerEncounteredError, func(e vlc.Event, userData interface{}) {
+		currentState = model.PlayerStateIdle
+		_ = global.EventBus.Publish(events.PlayerPropertyStateUpdate, events.PlayerPropertyStateUpdateEvent{
+			State: currentState,
+		})
+		_ = global.EventBus.Publish(events.PlayerPlayErrorUpdate, events.PlayerPlayErrorUpdateEvent{
+			Error: errors.New("vlc encountered playback error"),
+		})
+	}, nil)
+	if err != nil {
+		log.Error("register MediaPlayerEncounteredError event failed: ", err)
 	}
 
 	_, err = eventManager.Attach(vlc.MediaPlayerAudioVolume, func(e vlc.Event, userData interface{}) {
@@ -214,14 +251,32 @@ func registerEvents() {
 
 func registerCmdHandler() {
 	global.EventBus.Subscribe("", events.PlayerPlayCmd, "player.play", func(evnt *eventbus.Event) {
-		lock.Lock()
-		defer lock.Unlock()
-
 		mediaInfo := evnt.Data.(events.PlayerPlayCmdEvent).Media.Info
+		mediaData := evnt.Data.(events.PlayerPlayCmdEvent).Media
+		currentState = currentState.NextState(model.PlayerStateLoading)
+		_ = global.EventBus.Publish(events.PlayerPropertyStateUpdate, events.PlayerPropertyStateUpdateEvent{
+			State: currentState,
+		})
+
 		log.Infof("[VLC Player] Play media %s", mediaInfo.Title)
 
-		mediaUrls, err := miaosic.GetMediaUrl(mediaInfo.Meta, miaosic.QualityAny)
-		if err != nil || len(mediaUrls) == 0 {
+		respInfo, err := global.EventBus.Call(events.CmdMiaosicGetMediaInfo, events.ReplyMiaosicGetMediaInfo,
+			events.CmdMiaosicGetMediaInfoData{Meta: mediaData.Info.Meta})
+		if err == nil {
+			infoReply := respInfo.Data.(events.ReplyMiaosicGetMediaInfoData)
+			if infoReply.Error == nil {
+				mediaData.Info = infoReply.Info
+			}
+		}
+
+		_ = global.EventBus.Publish(events.PlayerPlayingUpdate, events.PlayerPlayingUpdateEvent{
+			Media:   mediaData,
+			Removed: false,
+		})
+
+		respURL, err := global.EventBus.Call(events.CmdMiaosicGetMediaUrl, events.ReplyMiaosicGetMediaUrl,
+			events.CmdMiaosicGetMediaUrlData{Meta: mediaData.Info.Meta, Quality: miaosic.QualityAny})
+		if err != nil {
 			log.Warn("[VLC PlayControl] get media url failed ", mediaInfo.Meta.ID(), err)
 			_ = global.EventBus.Publish(
 				events.PlayerPlayErrorUpdate,
@@ -230,49 +285,64 @@ func registerCmdHandler() {
 				})
 			return
 		}
-
-		// 创建媒体对象
-		var media *vlc.Media
-		log.Debugf("[VLC PlayControl] get player media %s", mediaUrls[0].Url)
-		if strings.HasPrefix(mediaUrls[0].Url, "http") {
-			media, err = vlc.NewMediaFromURL(mediaUrls[0].Url)
-		} else {
-			media, err = vlc.NewMediaFromPath(mediaUrls[0].Url)
-		}
-		if err != nil {
-			log.Error("create media failed: ", err)
+		mediaUrls := respURL.Data.(events.ReplyMiaosicGetMediaUrlData)
+		if mediaUrls.Error != nil || len(mediaUrls.Urls) == 0 {
+			replyErr := mediaUrls.Error
+			if replyErr == nil {
+				replyErr = errors.New("empty media url list")
+			}
+			log.Warn("[VLC PlayControl] get media url failed ", mediaInfo.Meta.ID(), replyErr)
+			_ = global.EventBus.Publish(
+				events.PlayerPlayErrorUpdate,
+				events.PlayerPlayErrorUpdateEvent{
+					Error: replyErr,
+				})
 			return
 		}
 
+		lock.Lock()
+		defer lock.Unlock()
+
+		// 创建媒体对象
+		var media *vlc.Media
+		mediaURL := mediaUrls.Urls[0]
+		log.Debugf("[VLC PlayControl] get player media %s", mediaURL.Url)
+		if strings.HasPrefix(mediaURL.Url, "http") {
+			media, err = vlc.NewMediaFromURL(mediaURL.Url)
+		} else {
+			media, err = vlc.NewMediaFromPath(mediaURL.Url)
+		}
+		if err != nil {
+			log.Error("create media failed: ", err)
+			_ = global.EventBus.Publish(events.PlayerPlayErrorUpdate, events.PlayerPlayErrorUpdateEvent{Error: err})
+			return
+		}
+		defer func() {
+			if err := media.Release(); err != nil {
+				log.Warn("release media failed: ", err)
+			}
+		}()
+
 		// 设置HTTP头
-		if val, ok := mediaUrls[0].Header["User-Agent"]; ok {
+		if val, ok := mediaURL.Header["User-Agent"]; ok {
 			err = media.AddOptions(":http-user-agent=" + val)
 			if err != nil {
 				log.Warn("add http-user-agent options failed: ", err)
 			}
 		}
-		if val, ok := mediaUrls[0].Header["Referer"]; ok {
+		if val, ok := mediaURL.Header["Referer"]; ok {
 			err = media.AddOptions(":http-referrer=" + val)
 			if err != nil {
 				log.Warn("add http-referrer options failed: ", err)
 			}
 		}
 
-		// 更新媒体信息
-		mediaData := evnt.Data.(events.PlayerPlayCmdEvent).Media
-		if m, err := miaosic.GetMediaInfo(mediaData.Info.Meta); err == nil {
-			mediaData.Info = m
-		}
 		currentMedia = mediaData
-
-		_ = global.EventBus.Publish(events.PlayerPlayingUpdate, events.PlayerPlayingUpdateEvent{
-			Media:   mediaData,
-			Removed: false,
-		})
 
 		// 播放
 		if err := player.SetMedia(media); err != nil {
 			log.Error("set media failed: ", err)
+			_ = global.EventBus.Publish(events.PlayerPlayErrorUpdate, events.PlayerPlayErrorUpdateEvent{Error: err})
 			return
 		}
 
@@ -284,6 +354,7 @@ func registerCmdHandler() {
 
 		if err := player.Play(); err != nil {
 			log.Error("play failed: ", err)
+			_ = global.EventBus.Publish(events.PlayerPlayErrorUpdate, events.PlayerPlayErrorUpdateEvent{Error: err})
 			return
 		}
 
@@ -295,9 +366,6 @@ func registerCmdHandler() {
 		})
 		_ = global.EventBus.Publish(events.PlayerPropertyPercentPosUpdate, events.PlayerPropertyPercentPosUpdateEvent{
 			PercentPos: 0,
-		})
-		_ = global.EventBus.Publish(events.PlayerPropertyStateUpdate, events.PlayerPropertyStateUpdateEvent{
-			State: model.PlayerStatePlaying,
 		})
 	})
 
@@ -326,10 +394,14 @@ func registerCmdHandler() {
 		lock.Lock()
 		defer lock.Unlock()
 		data := evnt.Data.(events.PlayerSeekCmdEvent)
+		var err error
 		if data.Absolute {
-			player.SetMediaTime(int(data.Position * 1000)) // 转换为毫秒
+			err = player.SetMediaTime(int(data.Position * 1000)) // 转换为毫秒
 		} else {
-			player.SetMediaPosition(float32(data.Position / 100))
+			err = player.SetMediaPosition(float32(data.Position / 100))
+		}
+		if err != nil {
+			log.Warn("seek failed", err)
 		}
 	})
 
@@ -345,7 +417,9 @@ func registerCmdHandler() {
 
 	global.EventBus.Subscribe("", events.PlayerVideoPlayerSetWindowHandleCmd, "player.set_window_handle", func(evnt *eventbus.Event) {
 		handle := evnt.Data.(events.PlayerVideoPlayerSetWindowHandleCmdEvent).Handle
-		setWindowHandle(handle)
+		if err := setWindowHandle(handle); err != nil {
+			log.Warn("set window handle failed", err)
+		}
 	})
 
 	global.EventBus.Subscribe("", events.PlayerSetAudioDeviceCmd, "player.set_audio_device", func(evnt *eventbus.Event) {
@@ -365,6 +439,10 @@ func registerCmdHandler() {
 func setAudioDevice(deviceID string) error {
 	lock.Lock()
 	defer lock.Unlock()
+
+	if deviceID == "" {
+		return nil
+	}
 
 	log.Infof("set audio device to: %s", deviceID)
 

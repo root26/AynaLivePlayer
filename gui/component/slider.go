@@ -36,3 +36,10 @@ func (s *SliderPlus) Dragged(e *fyne.DragEvent) {
 	s.Dragging = true
 	s.Slider.Dragged(e)
 }
+
+func (s *SliderPlus) Tapped(e *fyne.PointEvent) {
+	s.Slider.Tapped(e)
+	if s.OnDragEnd != nil {
+		s.OnDragEnd(s.Value)
+	}
+}

@@ -15,4 +15,5 @@ const ReplyMiaosicSearch = "update.search_result"
 
 type ReplyMiaosicSearchData struct {
 	Medias []model.Media
+	Error  error
 }

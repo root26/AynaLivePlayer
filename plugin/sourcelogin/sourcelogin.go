@@ -6,6 +6,7 @@ import (
 	"AynaLivePlayer/gui/component"
 	config2 "AynaLivePlayer/gui/views/config"
 	"AynaLivePlayer/pkg/config"
+	"AynaLivePlayer/pkg/eventbus"
 	"AynaLivePlayer/pkg/i18n"
 	"AynaLivePlayer/pkg/logger"
 	"AynaLivePlayer/resource"
@@ -55,15 +56,14 @@ func (w *SourceLogin) Enable() error {
 
 func (w *SourceLogin) Disable() error {
 	w.log.Info("save session for all provider")
-	providers := miaosic.ListAvailableProviders()
-	for _, pname := range providers {
-		if p, ok := miaosic.GetProvider(pname); ok {
-			pl, ok2 := p.(miaosic.Loginable)
-			if ok2 {
-				w.log.Infof("save session for %s", pname)
-				w.sessions[pname] = pl.SaveSession()
-			}
+	for _, provider := range w.listLoginableProviders() {
+		w.log.Infof("save session for %s", provider)
+		session, err := w.saveSession(provider)
+		if err != nil {
+			w.log.Warnf("save session for %s failed: %v", provider, err)
+			continue
 		}
+		w.sessions[provider] = session
 	}
 	return nil
 }
@@ -86,30 +86,16 @@ func (w *SourceLogin) CreatePanel() fyne.CanvasObject {
 		widget.NewLabel(i18n.T("plugin.sourcelogin.current_user")),
 		currentUser)
 
-	providers := miaosic.ListAvailableProviders()
-	loginableProviders := make([]string, 0)
-	loginables := make(map[string]miaosic.MediaProvider)
-	for _, pname := range providers {
-		if p, ok := miaosic.GetProvider(pname); ok {
-			pl, ok2 := p.(miaosic.Loginable)
-			if ok2 {
-				loginableProviders = append(loginableProviders, pname)
-				loginables[pname] = p
-				if session, ok3 := w.sessions[pname]; ok3 {
-					err := pl.RestoreSession(session)
-					if err != nil {
-						w.log.Error("failed to restore session for ", pname)
-					}
-				}
-			}
-		}
-	}
-	providerChoice := widget.NewSelect(loginableProviders, func(s string) {
+	providerChoice := widget.NewSelect([]string{}, func(s string) {
 		w.log.Info("switching provider to ", s)
 		if s != "" {
-			pvdr, _ := miaosic.GetProvider(s)
-			provider := pvdr.(miaosic.Loginable)
-			if provider.IsLogin() {
+			isLogin, err := w.isLogin(s)
+			if err != nil {
+				_ = global.EventBus.Publish(events.ErrorUpdate,
+					events.ErrorUpdateEvent{Error: err})
+				return
+			}
+			if isLogin {
 				currentUser.SetText(i18n.T("plugin.sourcelogin.current_user.loggedin"))
 			} else {
 				currentUser.SetText(i18n.T("plugin.sourcelogin.current_user.notlogin"))
@@ -119,11 +105,49 @@ func (w *SourceLogin) CreatePanel() fyne.CanvasObject {
 
 	sourcePanel := container.NewGridWithColumns(2,
 		providerChoice, currentStatus)
+	restoredSessions := make(map[string]bool)
+	_ = global.EventBus.Subscribe("",
+		events.MediaProviderUpdate,
+		"plugin.sourcelogin.providers",
+		func(event *eventbus.Event) {
+			data := event.Data.(events.MediaProviderUpdateEvent)
+			loginableProviders := make([]string, 0)
+			for _, providerInfo := range data.ProviderInfos {
+				if providerInfo.Loginable {
+					loginableProviders = append(loginableProviders, providerInfo.Name)
+				}
+			}
+			for _, provider := range loginableProviders {
+				if restoredSessions[provider] {
+					continue
+				}
+				session, ok := w.sessions[provider]
+				if !ok || session == "" {
+					continue
+				}
+				restoredSessions[provider] = true
+				go func(providerName string, providerSession string) {
+					if err := w.restoreSession(providerName, providerSession); err != nil {
+						w.log.Warnf("failed to restore session for %s: %v", providerName, err)
+					}
+				}(provider, session)
+			}
+			fyne.DoAndWait(func() {
+				providerChoice.Options = loginableProviders
+				providerChoice.Refresh()
+				if providerChoice.Selected == "" && len(loginableProviders) > 0 {
+					providerChoice.SetSelected(loginableProviders[0])
+				}
+			})
+		})
 
 	logoutBtn := component.NewAsyncButton(
 		i18n.T("plugin.sourcelogin.logout"),
 		func() {
-			err := loginables[providerChoice.Selected].(miaosic.Loginable).Logout()
+			if providerChoice.Selected == "" {
+				return
+			}
+			err := w.logout(providerChoice.Selected)
 			if err != nil {
 				_ = global.EventBus.Publish(events.ErrorUpdate,
 					events.ErrorUpdateEvent{Error: err})
@@ -153,14 +177,25 @@ func (w *SourceLogin) CreatePanel() fyne.CanvasObject {
 				qrStatus.SetText("")
 			})
 			w.log.Info("getting a new qr code for login")
-			pvdr, _ := miaosic.GetProvider(providerChoice.Selected)
-			provider := pvdr.(miaosic.Loginable)
-			currentLoginSession, err = provider.QrLogin()
+			resp, err := global.EventBus.Call(
+				events.CmdMiaosicQrLogin,
+				events.ReplyMiaosicQrLogin,
+				events.CmdMiaosicQrLoginData{
+					Provider: providerChoice.Selected,
+				},
+			)
 			if err != nil {
 				_ = global.EventBus.Publish(events.ErrorUpdate,
 					events.ErrorUpdateEvent{Error: err})
 				return
 			}
+			qrData := resp.Data.(events.ReplyMiaosicQrLoginData)
+			if qrData.Error != nil {
+				_ = global.EventBus.Publish(events.ErrorUpdate,
+					events.ErrorUpdateEvent{Error: qrData.Error})
+				return
+			}
+			currentLoginSession = &qrData.Session
 			w.log.Debugf("trying encode url %s to qrcode", currentLoginSession.Url)
 			data, err := qrcode.Encode(currentLoginSession.Url, qrcode.Medium, 256)
 			if err != nil {
@@ -186,26 +221,43 @@ func (w *SourceLogin) CreatePanel() fyne.CanvasObject {
 			if currentProvider == "" {
 				return
 			}
-			pvdr, _ := miaosic.GetProvider(currentProvider)
-			provider := pvdr.(miaosic.Loginable)
 			w.log.Info("checking qr status")
-			result, err := provider.QrLoginVerify(currentLoginSession)
+			resp, err := global.EventBus.Call(
+				events.CmdMiaosicQrLoginVerify,
+				events.ReplyMiaosicQrLoginVerify,
+				events.CmdMiaosicQrLoginVerifyData{
+					Provider: currentProvider,
+					Session:  *currentLoginSession,
+				},
+			)
 			if err != nil {
 				_ = global.EventBus.Publish(events.ErrorUpdate,
 					events.ErrorUpdateEvent{Error: err})
 				return
 			}
+			resultData := resp.Data.(events.ReplyMiaosicQrLoginVerifyData)
+			if resultData.Error != nil {
+				_ = global.EventBus.Publish(events.ErrorUpdate,
+					events.ErrorUpdateEvent{Error: resultData.Error})
+				return
+			}
 			fyne.DoAndWait(func() {
-				qrStatus.SetText(result.Message)
+				qrStatus.SetText(resultData.Result.Message)
 			})
-			if result.Success {
+			if resultData.Result.Success {
 				currentLoginSession = nil
 				fyne.DoAndWait(func() {
 					qrcodeImg.Resource = resource.ImageEmptyQrCode
 					qrcodeImg.Refresh()
 					providerChoice.OnChanged(currentProvider)
 				})
-				w.sessions[currentProvider] = provider.SaveSession()
+				session, sessionErr := w.saveSession(currentProvider)
+				if sessionErr != nil {
+					_ = global.EventBus.Publish(events.ErrorUpdate,
+						events.ErrorUpdateEvent{Error: sessionErr})
+					return
+				}
+				w.sessions[currentProvider] = session
 			}
 		},
 	)
@@ -215,4 +267,85 @@ func (w *SourceLogin) CreatePanel() fyne.CanvasObject {
 	)
 	w.panel = container.NewVBox(sourcePanel, controlBox, qrImagePanel)
 	return w.panel
+}
+
+func (w *SourceLogin) listLoginableProviders() []string {
+	resp, err := global.EventBus.Call(
+		events.CmdMiaosicListProviders,
+		events.ReplyMiaosicListProviders,
+		events.CmdMiaosicListProvidersData{},
+	)
+	if err != nil {
+		w.log.Warnf("list providers failed: %v", err)
+		return []string{}
+	}
+	data := resp.Data.(events.ReplyMiaosicListProvidersData)
+	providers := make([]string, 0)
+	for _, provider := range data.Providers {
+		if provider.Loginable {
+			providers = append(providers, provider.Name)
+		}
+	}
+	return providers
+}
+
+func (w *SourceLogin) isLogin(provider string) (bool, error) {
+	resp, err := global.EventBus.Call(
+		events.CmdMiaosicIsLoginByProvider,
+		events.ReplyMiaosicIsLoginByProvider,
+		events.CmdMiaosicIsLoginByProviderData{
+			Provider: provider,
+		},
+	)
+	if err != nil {
+		return false, err
+	}
+	data := resp.Data.(events.ReplyMiaosicIsLoginByProviderData)
+	return data.IsLogin, data.Error
+}
+
+func (w *SourceLogin) logout(provider string) error {
+	resp, err := global.EventBus.Call(
+		events.CmdMiaosicLogoutByProvider,
+		events.ReplyMiaosicLogoutByProvider,
+		events.CmdMiaosicLogoutByProviderData{
+			Provider: provider,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	data := resp.Data.(events.ReplyMiaosicLogoutByProviderData)
+	return data.Error
+}
+
+func (w *SourceLogin) restoreSession(provider, session string) error {
+	resp, err := global.EventBus.Call(
+		events.CmdMiaosicRestoreSessionByProvider,
+		events.ReplyMiaosicRestoreSessionByProvider,
+		events.CmdMiaosicRestoreSessionByProviderData{
+			Provider: provider,
+			Session:  session,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	data := resp.Data.(events.ReplyMiaosicRestoreSessionByProviderData)
+	return data.Error
+}
+
+func (w *SourceLogin) saveSession(provider string) (string, error) {
+	resp, err := global.EventBus.Call(
+		events.CmdMiaosicSaveSessionByProvider,
+		events.ReplyMiaosicSaveSessionByProvider,
+		events.CmdMiaosicSaveSessionByProviderData{
+			Provider: provider,
+		},
+	)
+	if err != nil {
+		return "", err
+	}
+	data := resp.Data.(events.ReplyMiaosicSaveSessionByProviderData)
+	return data.Session, data.Error
 }

@@ -18,7 +18,7 @@ func SetupPlayer() {
 
 func StopPlayer() {
 	if config.Experimental.PlayerCore == "vlc" {
-		//vlc.StopPlayer()
+		vlc.StopPlayer()
 	} else {
 		mpv.StopPlayer()
 	}
