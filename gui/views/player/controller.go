@@ -35,6 +35,7 @@ type PlayControllerContainer struct {
 	LrcWindowOpen bool
 	CurrentTime   *component.LabelFixedSize
 	TotalTime     *widget.Label
+	DurationSec   float64
 }
 
 func (p *PlayControllerContainer) SetDefaultCover() {
@@ -84,19 +85,22 @@ func registerPlayControllerHandler() {
 		PlayController.ButtonSwitch.Refresh()
 	}))
 
-	global.EventBus.Subscribe(gctx.EventChannel, events.PlayerPropertyPercentPosUpdate, "gui.player.controller.percent_pos", func(event *eventbus.Event) {
+	global.EventBus.Subscribe(gctx.EventChannel, events.PlayerPropertyPercentPosUpdate, "gui.player.controller.percent_pos", gutil.ThreadSafeHandler(func(event *eventbus.Event) {
 		if PlayController.Progress.Dragging {
 			return
 		}
+		// Keep this path async (Do, not DoAndWait) to avoid blocking eventbus handlers.
+		// Using ThreadSafeHandler here also avoids a second RunInFyneThread dispatch hop.
 		PlayController.Progress.Value = event.Data.(events.PlayerPropertyPercentPosUpdateEvent).PercentPos * 10
-		gutil.RunInFyneThread(PlayController.Progress.Refresh)
-	})
+		PlayController.Progress.Refresh()
+	}))
 
 	global.EventBus.Subscribe(gctx.EventChannel, events.PlayerPropertyStateUpdate, "gui.player.controller.idle_active", gutil.ThreadSafeHandler(func(event *eventbus.Event) {
 		state := event.Data.(events.PlayerPropertyStateUpdateEvent).State
 		if state == model.PlayerStateIdle || state == model.PlayerStateLoading {
 			PlayController.Progress.Value = 0
 			PlayController.Progress.Max = 0
+			PlayController.DurationSec = 0
 			//PlayController.Title.SetText("Title")
 			//PlayController.Artist.SetText("Artist")
 			//PlayController.Username.SetText("Username")
@@ -108,6 +112,15 @@ func registerPlayControllerHandler() {
 
 	PlayController.Progress.Max = 0
 	PlayController.Progress.OnDragEnd = func(f float64) {
+		if PlayController.DurationSec > 0 {
+			target := (f / PlayController.Progress.Max) * PlayController.DurationSec
+			_ = global.EventBus.PublishToChannel(gctx.EventChannel, events.PlayerSeekCmd, events.PlayerSeekCmdEvent{
+				Position: target,
+				Absolute: true,
+			})
+			return
+		}
+		// Fallback for unknown duration.
 		_ = global.EventBus.PublishToChannel(gctx.EventChannel, events.PlayerSeekCmd, events.PlayerSeekCmdEvent{
 			Position: f / 10,
 			Absolute: false,
@@ -119,7 +132,8 @@ func registerPlayControllerHandler() {
 	}))
 
 	global.EventBus.Subscribe(gctx.EventChannel, events.PlayerPropertyDurationUpdate, "gui.player.controller.duration", gutil.ThreadSafeHandler(func(event *eventbus.Event) {
-		PlayController.TotalTime.SetText(util.FormatTime(int(event.Data.(events.PlayerPropertyDurationUpdateEvent).Duration)))
+		PlayController.DurationSec = event.Data.(events.PlayerPropertyDurationUpdateEvent).Duration
+		PlayController.TotalTime.SetText(util.FormatTime(int(PlayController.DurationSec)))
 	}))
 
 	global.EventBus.Subscribe(gctx.EventChannel, events.PlayerPropertyVolumeUpdate, "gui.player.controller.volume", gutil.ThreadSafeHandler(func(event *eventbus.Event) {
@@ -138,6 +152,7 @@ func registerPlayControllerHandler() {
 		if event.Data.(events.PlayerPlayingUpdateEvent).Removed {
 			PlayController.Progress.Value = 0
 			PlayController.Progress.Max = 0
+			PlayController.DurationSec = 0
 			PlayController.TotalTime.SetText("0:00")
 			PlayController.CurrentTime.SetText("0:00")
 			PlayController.Title.SetText("Title")
